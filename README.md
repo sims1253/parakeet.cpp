@@ -35,7 +35,7 @@ The same clip fed to parakeet.cpp and to NeMo's own PyTorch runtime on the same 
 
 ![parakeet.cpp vs NeMo on GPU: identical output, parakeet.cpp finishes first](benchmarks/media/gpu_duel.gif)
 
-More head-to-heads, same accuracy and far less compute: [vs whisper.cpp turbo on GPU](benchmarks/media/gpu_whisper_duel.mp4) (about 12x faster) and [vs whisper.cpp turbo on CPU](benchmarks/media/cpu_duel.mp4) (about 27x faster).
+The same race on CPU, against NeMo's own PyTorch runtime: [parakeet.cpp vs NeMo on CPU](benchmarks/media/cpu_nemo_duel.mp4) (about 1.5x faster, still byte-for-byte identical). And vs whisper.cpp turbo, same accuracy and far less compute: [on GPU](benchmarks/media/gpu_whisper_duel.mp4) (about 12x faster) and [on CPU](benchmarks/media/cpu_duel.mp4) (about 27x faster).
 
 CPU numbers (20-core x86, vs NeMo PyTorch-CPU, LibriSpeech test-clean, threads=8; RTFx is audio-seconds over processing-seconds, so higher is faster):
 
