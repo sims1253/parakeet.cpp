@@ -8,9 +8,31 @@
 #include "ggml.h"
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <vector>
 
 namespace pk {
+
+// Decide the self-attention window for an encoder of Tp frames. Returns W>0 to
+// use NeMo rel_pos_local_attn [W,W] (banded, O(T*window)); -1 for full attention.
+//
+// The attention uses the chunk-matmul banded path (build_graph_local_chunked),
+// which emits O(1) graph nodes regardless of window, so W can go to NeMo's full
+// [128,128] without overflowing the metadata-context budget (backend.cpp
+// kGraphSize). (The older pad-and-shift path emitted ~6*(2W+1) nodes/layer,
+// which is why this was capped at 32.)
+static int local_attn_window(int Tp) {
+    constexpr int kMaxLocalWindow = 128;
+    if (const char* e = std::getenv("PARAKEET_ATT_CONTEXT")) {
+        const int w = std::atoi(e);
+        if (w <= 0) return -1;                 // 0 / negative -> force full attention
+        return w > kMaxLocalWindow ? kMaxLocalWindow : w;
+    }
+    // Auto: long audio (~>11 min at 8x subsampling) switches to local attention
+    // so full O(T^2) attention can't OOM the device.
+    constexpr int kLocalThreshold = 8192;
+    return Tp > kLocalThreshold ? kMaxLocalWindow : -1;
+}
 
 Encoder::Encoder(const ModelLoader& ml)
     : ml_(ml) {
@@ -60,10 +82,15 @@ void Encoder::forward_capture(const std::vector<float>& mel, int n_mels, int T,
                 x = ggml_scale(ctx, x, std::sqrt((float)d_model_));
             }
 
-            // ---- 3. Relative positional encoding pos_emb [d_model, 2T'-1]. ----
-            const int pos_len = 2 * Tp - 1;
+            // ---- 3. Positional encoding. Long audio uses NeMo
+            //         rel_pos_local_attn (banded, O(T*window)) so attention can't
+            //         OOM; short audio keeps full attention (NeMo-exact). ----
+            const int att_w   = local_attn_window(Tp);
+            const bool local  = att_w > 0;
+            const int pos_len = local ? (2 * att_w + 1) : (2 * Tp - 1);
             std::vector<float>& pe_host = pool.alloc_f32();
-            rel_pos_encoding(Tp, d_model_, pe_host); // row-major [pos_len, d_model]
+            if (local) local_rel_pos_encoding(att_w, att_w, d_model_, pe_host);
+            else       rel_pos_encoding(Tp, d_model_, pe_host); // [pos_len, d_model]
             int64_t pe_ne[2] = {d_model_, pos_len};
             ggml_tensor* pe = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2, pe_ne,
                                   pe_host.data(), pe_host.size() * sizeof(float));
@@ -71,7 +98,8 @@ void Encoder::forward_capture(const std::vector<float>& mel, int n_mels, int T,
             // ---- 4. Conformer layer stack (all in-graph). ----
             for (int i = 0; i < n_layers_; ++i) {
                 ConformerLayer layer(ml_, i);
-                x = layer.build_graph(ctx, x, Tp, pe, pos_len, valid_len, pool);
+                x = layer.build_graph(ctx, x, Tp, pe, pos_len, valid_len, pool,
+                                      local ? att_w : -1, local ? att_w : -1);
                 // Capture requested layer outputs from the SAME graph (row-major
                 // [T', d_model], matching the layer output orientation).
                 for (size_t c = 0; c < capture_layers.size(); ++c) {
@@ -122,10 +150,13 @@ void Encoder::forward_batch(const MelBatch& mels,
             // ---- 2. xscaling (gated; off for this model). ----
             if (xscaling_) x = ggml_scale(ctx, x, std::sqrt((float)d_model_));
 
-            // ---- 3. Relative positional encoding pos_emb [d_model, 2T'-1]. ----
-            const int pos_len = 2 * Tp - 1;
+            // ---- 3. Positional encoding (local for long audio; see B=1 path). ----
+            const int att_w   = local_attn_window(Tp);
+            const bool local  = att_w > 0;
+            const int pos_len = local ? (2 * att_w + 1) : (2 * Tp - 1);
             std::vector<float>& pe_host = pool.alloc_f32();
-            rel_pos_encoding(Tp, d_model_, pe_host); // row-major [pos_len, d_model]
+            if (local) local_rel_pos_encoding(att_w, att_w, d_model_, pe_host);
+            else       rel_pos_encoding(Tp, d_model_, pe_host); // [pos_len, d_model]
             int64_t pe_ne[2] = {d_model_, pos_len};
             ggml_tensor* pe = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2, pe_ne,
                                   pe_host.data(), pe_host.size() * sizeof(float));
@@ -133,7 +164,8 @@ void Encoder::forward_batch(const MelBatch& mels,
             // ---- 4. Conformer layer stack (all in-graph, shared pe). ----
             for (int i = 0; i < n_layers_; ++i) {
                 ConformerLayer layer(ml_, i);
-                x = layer.build_graph_batched(ctx, x, Tp, mels.B, pe, pos_len, vout, pool);
+                x = layer.build_graph_batched(ctx, x, Tp, mels.B, pe, pos_len, vout, pool,
+                                              local ? att_w : -1, local ? att_w : -1);
             }
             return x; // [d_model, Tp, B]
         }, flat);

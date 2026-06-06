@@ -19,4 +19,14 @@ namespace pk {
 // Output: row-major [2T-1, d_model] (d_model fastest), i.e. out[p*d_model + c].
 void rel_pos_encoding(int T, int d_model, std::vector<float>& out);
 
+// LOCAL relative positional encoding for NeMo rel_pos_local_attn
+// (LocalAttRelPositionalEncoding): positions run from +att_left DOWN TO
+// -att_right (att_left+att_right+1 rows), using the SAME sinusoid as
+// rel_pos_encoding. These are exactly the centre rows of the full table, so
+// banded attention's positional term is bit-identical to NeMo's local pos.
+//
+// Output: row-major [att_left+att_right+1, d_model] (d_model fastest).
+void local_rel_pos_encoding(int att_left, int att_right, int d_model,
+                            std::vector<float>& out);
+
 } // namespace pk

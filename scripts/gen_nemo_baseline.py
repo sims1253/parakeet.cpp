@@ -436,6 +436,16 @@ def main():
         help="dump per-token/word timestamps + max_prob confidence for both "
         "heads (TDT/RNNT + CTC) instead of the encoder-stage baseline.",
     )
+    ap.add_argument(
+        "--att-context-size",
+        type=int,
+        default=None,
+        help="if set to W, switch the encoder to NeMo local (Longformer) "
+        "attention via change_attention_model('rel_pos_local_attn', [W, W]) "
+        "before the forward, so the dumped pos_emb (2W+1), l0_attn_in/out and "
+        "transcripts reflect banded local attention. Anchors the C++ "
+        "banded-attention parity tests at NeMo quality.",
+    )
     args = ap.parse_args()
 
     is_local = pathlib.Path(args.model).exists()
@@ -451,6 +461,22 @@ def main():
     m.eval()
     # Determinism: zero the spectrogram dither so the mel is reproducible.
     m.preprocessor.featurizer.dither = 0.0
+
+    # Optional: switch to NeMo local (Longformer) attention so the dumped
+    # baseline anchors the C++ banded-attention path. Must run BEFORE the hooks
+    # below, since change_attention_model swaps the pos_enc and self_attn modules
+    # (a hook registered on the old module would never fire). Mirrors the v3
+    # model card's long-audio recipe.
+    if args.att_context_size is not None:
+        w = args.att_context_size
+        m.change_attention_model("rel_pos_local_attn", [w, w])
+        try:
+            m.change_subsampling_conv_chunking_factor(1)
+        except Exception as e:  # pragma: no cover - older NeMo without the API
+            print(f"note: change_subsampling_conv_chunking_factor skipped: {e}",
+                  file=sys.stderr)
+        print(f"local attention: rel_pos_local_attn att_context_size=[{w},{w}]",
+              file=sys.stderr)
 
     # --timestamps: dump per-token/word timestamps + max_prob confidence for both
     # heads, then return. Kept as a separate early path so the encoder-stage

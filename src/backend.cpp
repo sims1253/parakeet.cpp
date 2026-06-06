@@ -16,10 +16,19 @@
 
 namespace pk {
 
+// Gallocr buffer size (bytes) after the most recent single-backend (CPU)
+// compute. Lets tests assert attention memory scales O(T*window), not O(T^2).
+static size_t g_last_graph_alloc_bytes = 0;
+size_t last_graph_alloc_bytes() { return g_last_graph_alloc_bytes; }
+
 namespace {
 // Number of graph nodes the metadata context must hold. The biggest single
-// graph today is a streaming conformer layer (~150 nodes); leave generous head
-// room for Task 2's fused encoder (~85 layers worth of ops in one graph).
+// graph today is the fused encoder. Banded local attention adds O(window) ops
+// per layer (~6*(2W+1) nodes), so the encoder caps its window (see
+// local_attn_window) to stay within this budget; bumping it globally regresses
+// small models (~+22% on tdt_ctc-110m) because the per-compute context + graph
+// hash-set scale with kGraphSize. A larger window needs the efficient
+// chunk-matmul construction (O(1) nodes) instead.
 constexpr size_t kGraphSize = 16384;
 
 struct PendingInput {
@@ -242,6 +251,7 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
         }
         alloc_ok = ggml_gallocr_alloc_graph(impl_->galloc, gf);
         if (!alloc_ok) PK_LOG("Backend::compute: ggml_gallocr_alloc_graph failed");
+        else g_last_graph_alloc_bytes = ggml_gallocr_get_buffer_size(impl_->galloc, 0);
     }
     if (!alloc_ok) {
         impl_->pending.clear();

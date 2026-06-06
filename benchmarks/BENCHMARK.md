@@ -498,6 +498,34 @@ Transcripts from the **diverse** clip set (no ground truth for most). NeMo vs pa
 | NeMo (PyTorch CPU) | hello this is a test of the voxtrol speech to text system<EOU> |
 | parakeet.cpp f32 | hello this is a test of the voxtrol speech to text system<EOU> |
 
+## Long-audio attention (banded local)
+
+The FastConformer encoder uses **global** relative-position self-attention, which
+is O(T²) in time *and memory*. On a long clip this explodes: a ~16.6-min file
+subsamples to T≈12k encoder frames, and the score/mask tensors alone reach tens
+of GB — enough to OOM a node. parakeet.cpp ports NeMo's `rel_pos_local_attn`
+(Longformer-style **banded** attention, `change_attention_model('rel_pos_local_attn',[W,W])`):
+each query attends only to keys within a ±W window, making attention **O(T·W)**.
+It auto-enables for long audio (encoder frames > 8192); `PARAKEET_ATT_CONTEXT=W`
+forces a window (`0` = full attention). The band is built with a **chunk-matmul**
+construction (overlapping K/V chunks + one batched GEMM + a diagonal skew-view),
+so the graph node count is **independent of the window** — the window goes to
+NeMo's full `[128,128]` at no extra graph cost.
+
+**16.6-min clip** (`tdt-0.6b-v3`, f32, NVIDIA GB10 DGX Spark, CPU / 16 threads):
+
+| Attention | Window | Wall | RTFx | Peak RSS |
+|---|---|---|---|---|
+| full (global, O(T²)) | — | 148.3 s | 6.7× | 54.0 GB |
+| banded | W=32 | 39.5 s | 25.2× | 8.9 GB |
+| **banded** | **W=128** (NeMo full) | **36.9 s** | **27.0×** | **9.4 GB** |
+
+Banded attention at NeMo's full W=128 is **~4× faster and ~5.7× less peak memory**
+than the global path, with a coherent transcript — and the chunk-matmul keeps the
+wide window as cheap as the narrow one. Short clips (the LibriSpeech set above)
+stay on the global path and are byte-identical to before; banding only engages
+past the long-audio threshold.
+
 ## Findings
 
 ### Accuracy

@@ -33,6 +33,12 @@ bool run_graph(size_t mem_bytes, int n_threads,
 void set_num_threads(int n);
 int  num_threads();  // current override (0 == unset)
 
+// Gallocr buffer size (bytes) reserved for the most recent single-backend (CPU)
+// run_graph compute. Used by tests to assert that banded attention memory scales
+// O(T*window), not O(T^2). Reflects the high-water mark of the persistent
+// gallocr, so query it after a fresh run at the size of interest.
+size_t last_graph_alloc_bytes();
+
 class Backend;
 // The process-global persistent Backend (created lazily on first use). Exposed
 // so the weight-realization path can give the loader's tensors a backend buffer
