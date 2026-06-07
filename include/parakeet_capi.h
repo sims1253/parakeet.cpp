@@ -24,6 +24,12 @@ typedef struct parakeet_ctx parakeet_ctx;
 //     parakeet_capi_transcribe_pcm_batch_lang) for multilingual
 //     prompt-conditioned (nemotron) models. The original non-lang entry points
 //     are unchanged and delegate with the model default language.
+//
+// v4: added the streaming JSON entry points (parakeet_capi_stream_feed_json,
+//     parakeet_capi_stream_finalize_json) that surface per-word timestamps
+//     (start/end/conf) plus frame_sec alongside the newly-finalized text, and
+//     added "frame_sec" to the transcribe_*_json documents. The original entry
+//     points are unchanged.
 int parakeet_capi_abi_version(void);
 
 // Load a GGUF model. Returns an owning context, or NULL on failure.
@@ -101,11 +107,15 @@ int parakeet_capi_transcribe_pcm_batch_lang(parakeet_ctx* ctx,
 // parakeet_capi_transcribe_path. The JSON shape is:
 //
 //   {"text":"...",
+//    "frame_sec":0.080000,
 //    "words":[{"w":"...","start":0.480,"end":0.640,"conf":0.9100}, ...],
 //    "tokens":[{"id":123,"t":0.480,"conf":0.9100}, ...]}
 //
 // where "start"/"end"/"t" are seconds (3 decimals) and "conf" is the
-// confidence in (0,1] (4 decimals). The "w"/"text" strings are JSON-escaped
+// confidence in (0,1] (4 decimals). "frame_sec" is the encoder frame stride in
+// seconds (hop_length * subsampling_factor / sample_rate); multiply a frame-unit
+// segment gap threshold by it to get the seconds gap between words. The
+// "w"/"text" strings are JSON-escaped
 // (", \\, and control chars). On success returns the malloc'd string (free with
 // parakeet_capi_free_string); on error returns NULL and sets the context's last
 // error.
@@ -179,6 +189,25 @@ char* parakeet_capi_stream_feed(parakeet_stream* s, const float* pcm,
 // (malloc'd; "" if none, NULL on error). After this the running transcript is
 // complete. Does NOT fabricate an <EOU> NeMo's streaming would not emit.
 char* parakeet_capi_stream_finalize(parakeet_stream* s);
+
+// Like parakeet_capi_stream_feed but returns a malloc'd UTF-8 JSON document
+// instead of bare text:
+//   {"text":"...","eou":0,"frame_sec":0.080000,
+//    "words":[{"w":"...","start":0.480,"end":0.640,"conf":0.9100}, ...]}
+// "text" is the newly-finalized text since the last call ("" if none); "eou" is
+// 1 iff an <EOU>/<EOB> fired during this feed; "frame_sec" is the encoder frame
+// stride in seconds; "words" are the words finalized this call with absolute
+// (stream-relative) start/end seconds and 'min'-aggregate confidence (the same
+// drain as the offline pk::group_words). Returns NULL only on error (see
+// parakeet_capi_last_error). Free with parakeet_capi_free_string.
+char* parakeet_capi_stream_feed_json(parakeet_stream* s, const float* pcm,
+                                     int n_samples);
+
+// Like parakeet_capi_stream_finalize but returns the same JSON document shape as
+// parakeet_capi_stream_feed_json (flushing the end-of-stream tail; "eou" is
+// typically 0 — finalize does not fabricate an <EOU>). Free with
+// parakeet_capi_free_string; NULL only on error.
+char* parakeet_capi_stream_finalize_json(parakeet_stream* s);
 
 // Free a streaming session. Safe on NULL.
 void parakeet_capi_stream_free(parakeet_stream* s);

@@ -275,11 +275,12 @@ Timestamps and confidence as JSON (matches NeMo `timestamps=True` + `max_prob`):
 ```c
 char *json = parakeet_capi_transcribe_path_json(ctx, "audio.wav", 0 /*default*/);
 // {"text":"...",
+//  "frame_sec":0.080000,
 //  "words":[{"w":"Well,","start":0.480,"end":0.640,"conf":0.7859}, ...],
 //  "tokens":[{"id":639,"t":0.480,"conf":0.9969}, ...]}
 if (json) { printf("%s\n", json); parakeet_capi_free_string(json); }
 ```
-`start`/`end`/`t` are in seconds; `conf` is the rescaled softmax probability of the emitted token in `(0,1]` (a word's `conf` is the `min` over its tokens).
+`start`/`end`/`t` are in seconds; `conf` is the rescaled softmax probability of the emitted token in `(0,1]` (a word's `conf` is the `min` over its tokens). `frame_sec` is the encoder frame stride in seconds (`hop x subsampling / sample_rate`); multiply a frame-unit segment gap threshold (NeMo's `segment_gap_threshold`) by it to get the seconds gap between words when forming segments.
 
 ### Streaming (cache-aware EOU model)
 

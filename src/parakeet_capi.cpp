@@ -20,7 +20,11 @@
 //     stream_begin_lang / transcribe_pcm_batch_json_lang /
 //     transcribe_pcm_batch_lang) for multilingual prompt-conditioned (nemotron)
 //     models.
-#define PARAKEET_CAPI_ABI_VERSION 3
+// v4: streaming JSON entry points (stream_feed_json / stream_finalize_json) that
+//     surface per-word timestamps (start/end/conf) plus frame_sec alongside the
+//     newly-finalized text + eou flag, and a "frame_sec" field added to the
+//     transcribe_*_json documents. Original entry points unchanged.
+#define PARAKEET_CAPI_ABI_VERSION 4
 
 // The opaque context: a loaded model plus a buffer for the last error message.
 struct parakeet_ctx {
@@ -150,9 +154,14 @@ void append_json_float(std::string& out, const char* fmt, float v) {
 // (word start/end, token t) with %.3f, confidences with %.4f.
 std::string transcription_to_json(const pk::Transcription& tr, float frame_sec) {
     std::string out;
-    out.reserve(64 + tr.words.size() * 48 + tr.tokens.size() * 40);
+    out.reserve(80 + tr.words.size() * 48 + tr.tokens.size() * 40);
     out += "{\"text\":";
     append_json_string(out, tr.text);
+    // Encoder frame stride in seconds; lets consumers convert a frame-unit
+    // segment gap threshold (NeMo segment_gap_threshold) to the seconds gap
+    // between words when forming segments.
+    out += ",\"frame_sec\":";
+    append_json_float(out, "%.6f", frame_sec);
     out += ",\"words\":[";
     for (size_t i = 0; i < tr.words.size(); ++i) {
         if (i) out += ',';
@@ -562,6 +571,105 @@ extern "C" char* parakeet_capi_stream_finalize(parakeet_stream* s) {
         s->finalized = true;
         s->ctx->last_error.clear();
         char* out = dup_to_c(delta);
+        if (!out) { s->ctx->last_error = "out of memory"; return nullptr; }
+        return out;
+    } catch (const std::exception& e) {
+        s->ctx->last_error = e.what();
+        return nullptr;
+    } catch (...) {
+        s->ctx->last_error = "unknown error";
+        return nullptr;
+    }
+}
+
+namespace {
+
+// Serialize a streaming feed/finalize result to JSON: the newly-finalized text,
+// the eou flag, frame_sec, and the words drained this call (absolute seconds).
+// Shape matches the header doc on parakeet_capi_stream_feed_json.
+std::string stream_json(const std::string& text, int eou, float frame_sec,
+                        const std::vector<pk::Word>& words) {
+    std::string out;
+    out.reserve(80 + words.size() * 48);
+    out += "{\"text\":";
+    append_json_string(out, text);
+    out += ",\"eou\":";
+    out += (eou ? "1" : "0");
+    out += ",\"frame_sec\":";
+    append_json_float(out, "%.6f", frame_sec);
+    out += ",\"words\":[";
+    for (size_t i = 0; i < words.size(); ++i) {
+        if (i) out += ',';
+        out += "{\"w\":";
+        append_json_string(out, words[i].text);
+        out += ",\"start\":";
+        append_json_float(out, "%.3f", words[i].start);
+        out += ",\"end\":";
+        append_json_float(out, "%.3f", words[i].end);
+        out += ",\"conf\":";
+        append_json_float(out, "%.4f", words[i].conf);
+        out += '}';
+    }
+    out += "]}";
+    return out;
+}
+
+// frame_sec for the stream's model (encoder frame stride in seconds).
+float stream_frame_sec(const parakeet_stream* s) {
+    const pk::ParakeetConfig& cfg = s->ctx->model->config();
+    return (float)cfg.hop_length * (float)cfg.subsampling_factor / (float)cfg.sample_rate;
+}
+
+} // namespace
+
+extern "C" char* parakeet_capi_stream_feed_json(parakeet_stream* s,
+                                                const float* pcm, int n_samples) {
+    if (!s) return nullptr;
+    if (!s->ctx || !s->ctx->model) return nullptr;
+    if (n_samples < 0 || (!pcm && n_samples > 0)) {
+        s->ctx->last_error = "invalid PCM buffer";
+        return nullptr;
+    }
+    try {
+        if (n_samples > 0) {
+            int n_new = 0;
+            std::vector<float> frames = s->mel->feed(pcm, n_samples, n_new);
+            append_mel_frames(s, frames, n_new);
+        }
+        int eou = 0;
+        std::string delta = feed_available(s, /*flush=*/false, eou);
+        std::vector<pk::Word> words = s->sess->drain_words();
+        std::string json = stream_json(delta, eou, stream_frame_sec(s), words);
+        s->ctx->last_error.clear();
+        char* out = dup_to_c(json);
+        if (!out) { s->ctx->last_error = "out of memory"; return nullptr; }
+        return out;
+    } catch (const std::exception& e) {
+        s->ctx->last_error = e.what();
+        return nullptr;
+    } catch (...) {
+        s->ctx->last_error = "unknown error";
+        return nullptr;
+    }
+}
+
+extern "C" char* parakeet_capi_stream_finalize_json(parakeet_stream* s) {
+    if (!s) return nullptr;
+    if (!s->ctx || !s->ctx->model) return nullptr;
+    try {
+        if (s->mel) {
+            int n_tail = 0;
+            std::vector<float> tail = s->mel->finalize(n_tail);
+            append_mel_frames(s, tail, n_tail);
+        }
+        int eou = 0;
+        std::string delta = feed_available(s, /*flush=*/true, eou);
+        delta += s->sess->finalize();
+        std::vector<pk::Word> words = s->sess->drain_words();
+        std::string json = stream_json(delta, eou, stream_frame_sec(s), words);
+        s->finalized = true;
+        s->ctx->last_error.clear();
+        char* out = dup_to_c(json);
         if (!out) { s->ctx->last_error = "out of memory"; return nullptr; }
         return out;
     } catch (const std::exception& e) {
