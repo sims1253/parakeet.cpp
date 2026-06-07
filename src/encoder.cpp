@@ -198,4 +198,88 @@ void Encoder::forward_batch(const MelBatch& mels,
     }
 }
 
+void Encoder::run_post_subsampling_batch(const std::vector<float>& x0_host,
+            int Tp, int B, const std::vector<int>& vout,
+            std::vector<std::vector<float>>& enc_outs, int& d_model, int& Tout,
+            std::vector<int>& valid_Tout) const {
+    // Mirror of forward_batch's post-subsampling body (steps 2-4 + per-item
+    // split), but the subsampled features arrive pre-computed in x0_host and are
+    // injected as a graph input instead of built via sub.build_graph_batched.
+    GraphInputPool pool;
+    std::vector<float> flat; // receives [d_model, Tp, B] (ne0=d_model fastest)
+    bool ok = pk::run_graph(/*mem_bytes*/0, /*n_threads*/0,
+        [&](ggml_context* ctx) -> ggml_tensor* {
+            // ---- 1. Inject pre-subsampled features x [d_model, Tp, B]. ----
+            int64_t x_ne[3] = { d_model_, Tp, B };
+            ggml_tensor* x = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 3, x_ne,
+                                 x0_host.data(), x0_host.size() * sizeof(float));
+
+            // ---- 2. xscaling (gated; off for this model). ----
+            if (xscaling_) x = ggml_scale(ctx, x, std::sqrt((float)d_model_));
+
+            // ---- 3. Positional encoding (local for long audio; see B=1 path). ----
+            const int att_w   = local_attn_window(Tp);
+            const bool local  = att_w > 0;
+            const int pos_len = local ? (2 * att_w + 1) : (2 * Tp - 1);
+            std::vector<float>& pe_host = pool.alloc_f32();
+            if (local) local_rel_pos_encoding(att_w, att_w, d_model_, pe_host);
+            else       rel_pos_encoding(Tp, d_model_, pe_host); // [pos_len, d_model]
+            int64_t pe_ne[2] = {d_model_, pos_len};
+            ggml_tensor* pe = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 2, pe_ne,
+                                  pe_host.data(), pe_host.size() * sizeof(float));
+
+            // ---- 4. Conformer layer stack (all in-graph, shared pe). ----
+            for (int i = 0; i < n_layers_; ++i) {
+                ConformerLayer layer(ml_, i);
+                x = layer.build_graph_batched(ctx, x, Tp, B, pe, pos_len, vout, pool,
+                                              local ? att_w : -1, local ? att_w : -1);
+            }
+            return x; // [d_model, Tp, B]
+        }, flat);
+
+    assert(ok && "tiled post-subsampling encoder graph failed");
+    (void)ok;
+
+    d_model = d_model_;
+    Tout = Tp;
+    valid_Tout = vout;
+    enc_outs.assign(B, std::vector<float>());
+    for (int b = 0; b < B; ++b) {
+        const int tv = vout[b];
+        enc_outs[b].resize((size_t)d_model_ * tv);
+        for (int t = 0; t < tv; ++t)
+            for (int c = 0; c < d_model_; ++c)
+                enc_outs[b][(size_t)c * tv + t] =
+                    flat[(((size_t)b * Tp) + t) * d_model_ + c];
+    }
+}
+
+void Encoder::forward_batch_tiled(const MelBatch& mels,
+        std::vector<std::vector<float>>& enc_outs, int& d_model, int& Tout,
+        std::vector<int>& valid_Tout, int tile_out_frames) const {
+    Subsampling sub(ml_);
+    const int B = mels.B;
+    std::vector<std::vector<float>> sub_b(B);   // each [Tp_b, d_model] (t*dm+c)
+    std::vector<int> Tp_b(B), vout(B);
+    int Tp_max = 0, dm = 0;
+    for (int b = 0; b < B; ++b) {
+        // slice item b's real mel [n_mels, valid_T[b]] out of the padded batch buffer
+        std::vector<float> mel((size_t)mels.n_mels * mels.valid_T[b]);
+        for (int m = 0; m < mels.n_mels; ++m)
+            for (int t = 0; t < mels.valid_T[b]; ++t)
+                mel[(size_t)m*mels.valid_T[b]+t] =
+                    mels.data[((size_t)b*mels.n_mels+m)*mels.T_max + t];
+        int Tp=0, vl=0;
+        sub.forward_tiled(mel, mels.n_mels, mels.valid_T[b], tile_out_frames,
+                          sub_b[b], Tp, dm, vl);
+        Tp_b[b]=Tp; vout[b]=vl; if (Tp>Tp_max) Tp_max=Tp;
+    }
+    // assemble x0 [d_model, Tp_max, B], zero-padded per item.
+    // sub_b[b] is [Tp_b, d_model] (t*dm+c); x0 wants (c,t,b) at (b*Tp_max+t)*dm+c.
+    std::vector<float> x0((size_t)dm*Tp_max*B, 0.0f);
+    for (int b=0;b<B;++b) for (int t=0;t<Tp_b[b];++t) for (int c=0;c<dm;++c)
+        x0[((size_t)b*Tp_max+t)*dm+c] = sub_b[b][(size_t)t*dm+c];
+    run_post_subsampling_batch(x0, Tp_max, B, vout, enc_outs, d_model, Tout, valid_Tout);
+}
+
 } // namespace pk

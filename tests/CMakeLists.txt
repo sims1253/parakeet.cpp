@@ -13,6 +13,7 @@ pk_add_test(test_fft)
 pk_add_test(test_mel)
 pk_add_test(test_mel_gpu)
 pk_add_test(test_subsampling)
+pk_add_test(test_subsampling_tiling)
 pk_add_test(test_subsampling_batch)
 pk_add_test(test_subsampling_batch_causal)
 pk_add_test(test_relpos_attention)
@@ -24,6 +25,7 @@ pk_add_test(test_conformer)
 pk_add_test(test_conformer_batch)
 pk_add_test(test_conv_eou)
 pk_add_test(test_encoder)
+pk_add_test(test_encoder_long)
 pk_add_test(test_encoder_batch)
 pk_add_test(test_encoder_batch_local)
 pk_add_test(test_encoder_eou)
@@ -45,6 +47,7 @@ pk_add_test(test_transcribe_batch_ts)
 pk_add_test(test_tokenizer)
 pk_add_test(test_transcribe)
 pk_add_test(test_transcribe_speech)
+pk_add_test(test_transcribe_tiled)
 pk_add_test(test_transcribe_tdt)
 pk_add_test(test_transcribe_0_6b)
 pk_add_test(test_transcribe_ctc)
@@ -68,7 +71,7 @@ set_tests_properties(test_model_loader test_mel test_mel_gpu test_subsampling te
                      test_joint test_joint_step_batch test_prompt_kernel test_transducer_core test_tdt_greedy
                      test_transducer_greedy_batch test_transducer_greedy_batch_rnnt
                      test_timestamps_tokens test_timestamps test_transcribe_batch_ts test_tokenizer test_transcribe
-                     test_transcribe_speech test_transcribe_tdt test_transcribe_0_6b
+                     test_transcribe_speech test_transcribe_tiled test_transcribe_tdt test_transcribe_0_6b
                      test_transcribe_ctc test_transcribe_rnnt test_transcribe_eou test_transcribe_nemotron
                      test_streaming_decode test_streaming_eou_reset test_streaming_nemotron test_streaming_mel test_capi test_capi_batch test_capi_stream test_capi_stream_json
                      test_capi_timestamps test_capi_batch_json
@@ -83,7 +86,7 @@ set_tests_properties(test_mel test_mel_gpu test_subsampling test_subsampling_bat
                      test_timestamps_tokens
                      test_timestamps test_transcribe_batch_ts
                      test_tokenizer test_transcribe
-                     test_transcribe_speech test_transcribe_tdt test_transcribe_0_6b
+                     test_transcribe_speech test_transcribe_tiled test_transcribe_tdt test_transcribe_0_6b
                      test_transcribe_ctc test_transcribe_rnnt test_transcribe_eou test_transcribe_nemotron
                      test_streaming_decode test_streaming_eou_reset test_streaming_nemotron test_streaming_mel test_capi test_capi_batch test_capi_stream test_capi_stream_json
                      test_capi_timestamps test_capi_batch_json

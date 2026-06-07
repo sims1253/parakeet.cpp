@@ -61,12 +61,25 @@ public:
                  std::vector<float>& out, int& Tout, int& d_model,
                  int& valid_len, int in_valid_frames) const;
 
+    // Tiled subsampling for long audio: result is identical to forward() within the
+    // valid region, but no intermediate tensor exceeds a tile_out_frames-bounded size.
+    // tile_out_frames = number of OUTPUT (subsampled) frames per tile. Non-causal only;
+    // causal falls back to the single-graph path.
+    void forward_tiled(const std::vector<float>& mel, int n_mels, int T,
+                       int tile_out_frames, std::vector<float>& out,
+                       int& Tout, int& d_model, int& valid_len) const;
+
     // Number of valid (non-pad) output frames for an input of T mel frames,
     // applying the same per-stage `calc_length` reductions NeMo uses. Pure
     // arithmetic, no graph; exposed so the encoder can derive valid_len.
     // `in_valid_frames` (>=0) overrides the offline T-1 entry valid length
     // with an explicit count (streaming); <0 keeps the offline convention.
     int valid_out_len(int T, int in_valid_frames = -1) const;
+
+    // Number of (subsampled) output spatial frames an input of T mel frames
+    // produces, applying ggml conv2d's per-stage OH = floor((in+2p-k)/s)+1 for
+    // all three stride-2, k=3 stages. Used for subsampling-tile bookkeeping.
+    int subsample_len(int T) const;
 private:
     const ModelLoader& ml_;
     int conv_channels_;   // C

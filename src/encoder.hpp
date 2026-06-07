@@ -45,6 +45,18 @@ public:
                        int& d_model, int& Tout,
                        std::vector<int>& valid_Tout) const;
 
+    // Long-audio tiled variant of forward_batch: subsampling is done per item via
+    // Subsampling::forward_tiled (which bounds intermediate tensor size so the
+    // >2^31-element conv tensors that crash long clips never materialise), then
+    // the pre-subsampled features are fed into the existing post-subsampling graph
+    // (xscaling + positional encoding + conformer stack). Same output contract as
+    // forward_batch. `tile_out_frames` = subsampled output frames per tile.
+    void forward_batch_tiled(const MelBatch& mels,
+                             std::vector<std::vector<float>>& enc_outs,
+                             int& d_model, int& Tout,
+                             std::vector<int>& valid_Tout,
+                             int tile_out_frames) const;
+
     // Same as forward(), but also captures the per-layer outputs at indices
     // `capture_layers` (each row-major [T', d_model]) into `layer_outs` (parallel
     // to capture_layers). Used by the parity test to localize divergence.
@@ -54,6 +66,18 @@ public:
                          std::vector<std::vector<float>>& layer_outs) const;
 
 private:
+    // Mirrors forward_batch's post-subsampling body (xscaling + positional
+    // encoding + conformer stack + per-item channels-first split) for the tiled
+    // path, but takes the already-subsampled features `x0_host` ([d_model, Tp, B]
+    // in ggml order, element (c,t,b) at ((size_t)b*Tp+t)*d_model+c) injected as a
+    // graph input instead of building them from sub.build_graph_batched. `vout`
+    // holds the per-item valid output-frame counts. `x0_host` must outlive the
+    // call (run_graph is synchronous), which it does as a by-reference parameter.
+    void run_post_subsampling_batch(const std::vector<float>& x0_host,
+            int Tp, int B, const std::vector<int>& vout,
+            std::vector<std::vector<float>>& enc_outs, int& d_model, int& Tout,
+            std::vector<int>& valid_Tout) const;
+
     const ModelLoader& ml_;
     int d_model_;
     int n_layers_;

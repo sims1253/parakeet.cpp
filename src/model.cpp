@@ -4,6 +4,7 @@
 #include "mel.hpp"
 #include "mel_gpu.hpp"
 #include "encoder.hpp"
+#include "subsampling.hpp"
 #include "ctc_decoder.hpp"
 #include "search.hpp"
 #include "tokenizer.hpp"
@@ -19,6 +20,7 @@
 #include "ggml_graph.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <vector>
 
@@ -49,6 +51,12 @@ std::unique_ptr<Model> Model::load(const std::string& gguf_path) {
     ensure_weights_realized(m->loader_);
     return m;
 }
+
+// Forward declarations: subsampling-tiling helpers are defined below (after the
+// batched staging helpers) but used by the single-clip transcribe entry points.
+static int safe_mel_window(const pk::ParakeetConfig& cfg);
+static int subsampling_tile_for(const pk::ParakeetConfig& cfg,
+                                const pk::ModelLoader& ml, int T_max);
 
 int Model::resolve_prompt_index(const std::string& target_lang) const {
     const ParakeetConfig& cfg = loader_.config();
@@ -122,7 +130,23 @@ std::string Model::transcribe_16k(const std::vector<float>& pcm16k,
     Encoder encoder(loader_);
     std::vector<float> enc_out;
     int d_model = 0, Tout = 0;
-    encoder.forward(feats, n_mels, T, enc_out, d_model, Tout);
+    // Long audio: the single-clip forward() would overflow ggml's 2^31 subsampling
+    // limit. Delegate to the tiled batched path with a 1-item batch (faithful,
+    // reuses forward_batch_tiled). Short audio keeps the fused single-clip path.
+    const int sub_tile = subsampling_tile_for(cfg, loader_, T);
+    if (sub_tile > 0) {
+        MelBatch mb1;
+        mb1.B = 1; mb1.n_mels = n_mels; mb1.T_max = T; mb1.valid_T = { T };
+        mb1.data = feats;   // feats is [n_mels,T] = the B=1 batch buffer
+        std::vector<std::vector<float>> eo; std::vector<int> vT;
+        int dm1 = 0, To1 = 0;
+        encoder.forward_batch_tiled(mb1, eo, dm1, To1, vT, sub_tile);
+        enc_out = std::move(eo[0]);   // channels-first [d_model, vT[0]]
+        d_model = dm1;
+        Tout = vT[0];
+    } else {
+        encoder.forward(feats, n_mels, T, enc_out, d_model, Tout);
+    }
 
     // 2b. Prompt conditioning (multilingual nemotron): project the encoder
     //     output with the selected language one-hot before decoding. No-op for
@@ -134,6 +158,36 @@ std::string Model::transcribe_16k(const std::vector<float>& pcm16k,
         || (decoder == Decoder::kDefault && arch_prefers_tdt(cfg.arch));
 
     return decode_enc_out(loader_, enc_out, d_model, Tout, use_tdt);
+}
+
+// Max mel frames per encoder pass before the first subsampling conv output
+// (n_mels/2 * T/2 * conv_channels) approaches INT_MAX. ggml's CUDA unary (relu)
+// kernel indexes elements with int32, so a tensor > 2^31 elements crashes
+// ("invalid configuration argument"). Bound the per-pass first-conv tensor to a
+// safe 1.5e9 elements: (n_mels/2)*(T/2)*C < 1.5e9  =>  T < 2*1.5e9 / ((n_mels/2)*C).
+static int safe_mel_window(const pk::ParakeetConfig& cfg) {
+    const long long per_t = (long long)((int)cfg.n_mels / 2) * (int)cfg.subsampling_conv_channels; // first-conv elems per output mel-row pair
+    if (per_t <= 0) return 1 << 30;            // unknown config -> effectively no cap
+    const long long bound = 1500000000LL;      // 1.5e9 elements, safe margin under 2^31
+    long long win = (2 * bound) / per_t;        // T such that (n_mels/2)*(T/2)*C ~= bound
+    if (win < 16384) win = 16384;               // floor for tiny/odd configs
+    if (win > (1LL<<30)) win = (1LL<<30);
+    return (int)win;
+}
+
+// Decide whether to tile the subsampling stage for a mel of T_max frames.
+// Returns the tile size (output frames per tile, >0) to tile, or 0 to use the
+// fused path. Tiling engages for long audio (first subsampling conv would exceed
+// ggml's 2^31 element limit) or when PARAKEET_SUBSAMPLING_TILE forces it (testing).
+static int subsampling_tile_for(const pk::ParakeetConfig& cfg,
+                                const pk::ModelLoader& ml, int T_max) {
+    if (const char* e = std::getenv("PARAKEET_SUBSAMPLING_TILE")) {
+        const int t = std::atoi(e);
+        if (t > 0) return t;
+    }
+    const int win = safe_mel_window(cfg);
+    if (T_max > win) return pk::Subsampling(ml).subsample_len(win);
+    return 0;
 }
 
 // Stage a batch of 16 kHz mono clips into a MelBatch: per-clip log-mel
@@ -201,7 +255,15 @@ std::vector<std::string> Model::transcribe_16k_batch(
     Encoder encoder(loader_);
     std::vector<std::vector<float>> enc_outs; int d_model = 0, Tout = 0;
     std::vector<int> valid_Tout;
-    encoder.forward_batch(mb, enc_outs, d_model, Tout, valid_Tout);
+    // Long audio: the first subsampling conv would exceed ggml's 2^31 element limit.
+    // Tile the subsampling stage (faithful; see Encoder::forward_batch_tiled). An env
+    // override forces the tiled path for testing on short clips.
+    const int sub_tile = subsampling_tile_for(cfg, loader_, mb.T_max);
+    if (sub_tile > 0) {
+        encoder.forward_batch_tiled(mb, enc_outs, d_model, Tout, valid_Tout, sub_tile);
+    } else {
+        encoder.forward_batch(mb, enc_outs, d_model, Tout, valid_Tout);
+    }
 
     // 2b. Prompt conditioning per item (one language for the whole batch). No-op
     //     for non-prompt models.
@@ -320,7 +382,23 @@ Transcription Model::transcribe_16k_with_timestamps(
     Encoder encoder(loader_);
     std::vector<float> enc_out;
     int d_model = 0, Tout = 0;
-    encoder.forward(feats, n_mels, T, enc_out, d_model, Tout);
+    // Long audio: the single-clip forward() would overflow ggml's 2^31 subsampling
+    // limit. Delegate to the tiled batched path with a 1-item batch (faithful,
+    // reuses forward_batch_tiled). Short audio keeps the fused single-clip path.
+    const int sub_tile = subsampling_tile_for(cfg, loader_, T);
+    if (sub_tile > 0) {
+        MelBatch mb1;
+        mb1.B = 1; mb1.n_mels = n_mels; mb1.T_max = T; mb1.valid_T = { T };
+        mb1.data = feats;   // feats is [n_mels,T] = the B=1 batch buffer
+        std::vector<std::vector<float>> eo; std::vector<int> vT;
+        int dm1 = 0, To1 = 0;
+        encoder.forward_batch_tiled(mb1, eo, dm1, To1, vT, sub_tile);
+        enc_out = std::move(eo[0]);   // channels-first [d_model, vT[0]]
+        d_model = dm1;
+        Tout = vT[0];
+    } else {
+        encoder.forward(feats, n_mels, T, enc_out, d_model, Tout);
+    }
 
     // 2b. Prompt conditioning (nemotron): project before decode. No-op otherwise.
     maybe_apply_prompt(loader_, enc_out, d_model, Tout, prompt_index);
@@ -348,7 +426,15 @@ std::vector<Transcription> Model::transcribe_16k_batch_with_timestamps(
     Encoder encoder(loader_);
     std::vector<std::vector<float>> enc_outs; int d_model = 0, Tout = 0;
     std::vector<int> valid_Tout;
-    encoder.forward_batch(mb, enc_outs, d_model, Tout, valid_Tout);
+    // Long audio: the first subsampling conv would exceed ggml's 2^31 element limit.
+    // Tile the subsampling stage (faithful; see Encoder::forward_batch_tiled). An env
+    // override forces the tiled path for testing on short clips.
+    const int sub_tile = subsampling_tile_for(cfg, loader_, mb.T_max);
+    if (sub_tile > 0) {
+        encoder.forward_batch_tiled(mb, enc_outs, d_model, Tout, valid_Tout, sub_tile);
+    } else {
+        encoder.forward_batch(mb, enc_outs, d_model, Tout, valid_Tout);
+    }
 
     // Prompt conditioning per item (one language for the whole batch). No-op
     // for non-prompt models.
