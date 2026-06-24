@@ -8,6 +8,17 @@
 
 namespace pk {
 
+// Replayable per-step joint graph. Built once (first step_logits), replayed on
+// every subsequent step. Holds the persistent ReplayGraph + the two input
+// tensor handles so step_logits can feed fresh enc_proj/g rows each step
+// without rebuilding the graph. Keeping the underlying ggml context alive is
+// what lets ggml-cuda capture+replay the per-token joint (megapar's idea).
+struct Joint::StepReplay {
+    std::unique_ptr<ReplayGraph> rg;
+    ggml_tensor* ep = nullptr;  // input #0: enc_proj row for frame t [H]
+    ggml_tensor* g  = nullptr;  // input #1: pred-net output g [P]
+};
+
 Joint::Joint(const ModelLoader& ml) : ml_(ml) {
     // Read joint_hidden from the enc weight shape: ne[1] (ggml) = joint_hidden.
     ggml_tensor* ew = ml.tensor("joint.enc.weight");
@@ -33,6 +44,9 @@ Joint::Joint(const ModelLoader& ml) : ml_(ml) {
            "joint_net.2 weight shape mismatch");
     (void)wout;
 }
+
+// Out-of-line so the header's unique_ptr<StepReplay> can stay incomplete there.
+Joint::~Joint() = default;
 
 void Joint::precompute_enc_proj(const std::vector<float>& enc, int T, int enc_hidden,
                                 std::vector<float>& enc_proj) const {
@@ -68,39 +82,70 @@ void Joint::step_logits(const float* enc_proj_t,
     assert(pred_hidden == pred_hidden_ && "pred_hidden mismatch");
     const int H = joint_hidden_;
 
-    // Per-step joint on the PERSISTENT backend (one reused graph; no per-call
-    // ggml_init/gallocr churn — Backend::compute reuses the backend + gallocr).
-    // The two matmuls (pred.weight: P->H and joint_net.2.weight: H->V) are the
-    // hot cost and are memory-bandwidth bound (the H->V weight is ~2.6 MB read
-    // every step); ggml's matmul parallelizes the output dimension across the
-    // worker threads, hitting much higher aggregate memory bandwidth than a
-    // single-threaded C++ matvec — measured ~15x faster per step (26us vs 389us)
-    // on the 110m. The enc_proj input is the precomputed projection row for t.
-    bool ok = pk::run_graph(0, 0,
-        [&](ggml_context* ctx) -> ggml_tensor* {
-            // enc_proj row for frame t: [H].
-            int64_t ep_ne[1] = { H };
-            ggml_tensor* ep = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 1, ep_ne,
-                                  enc_proj_t, (size_t)H * sizeof(float));
-            // pred-net output g: [P].
-            int64_t g_ne[1] = { pred_hidden_ };
-            ggml_tensor* gv = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 1, g_ne,
-                                  g, (size_t)pred_hidden_ * sizeof(float));
-            // pred_proj = pred.weight·g + pred.bias  (P->H). Weight ne=[P,H].
-            ggml_tensor* Wp = pk::clone_weight(ctx, ml_, "joint.pred.weight");
-            ggml_tensor* pp = ggml_mul_mat(ctx, Wp, gv);            // [H]
-            ggml_tensor* bp = pk::clone_weight(ctx, ml_, "joint.pred.bias");
-            pp = ggml_add(ctx, pp, bp);
-            // f = ReLU(enc_proj + pred_proj)
-            ggml_tensor* f = ggml_relu(ctx, ggml_add(ctx, ep, pp)); // [H]
-            // logits = joint_net.2.weight·f + joint_net.2.bias (H->V). Weight ne=[H,V].
-            ggml_tensor* Wo = pk::clone_weight(ctx, ml_, "joint.joint_net.2.weight");
-            ggml_tensor* y  = ggml_mul_mat(ctx, Wo, f);             // [V]
-            ggml_tensor* bo = pk::clone_weight(ctx, ml_, "joint.joint_net.2.bias");
-            y = ggml_add(ctx, y, bo);
-            return y;                                               // [V_plus]
-        }, logits);
-    assert(ok && "step_logits graph failed");
+    // Per-step joint. On a GPU backend the work is launch-overhead bound, so we
+    // build the graph ONCE and REPLAY it every step: keeping the ggml context
+    // alive makes cgraph->nodes[0] a stable pointer, so ggml-cuda captures +
+    // replays the per-token joint instead of launching every op directly (the
+    // megapar win; ~290ms -> tens of ms on the 0.6b GPU decode). On CPU the
+    // per-step work is already cheap (multithreaded matmul; the launch overhead
+    // is negligible), and replay's set_input + readback overhead would be a net
+    // regression, so CPU keeps the original per-call run_graph path. The GPU
+    // compute is byte-identical to the CPU path: same ops, order, weights.
+    if (!global_backend().is_gpu()) {
+        bool ok = pk::run_graph(0, 0,
+            [&](ggml_context* ctx) -> ggml_tensor* {
+                int64_t ep_ne[1] = { H };
+                ggml_tensor* ep = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 1, ep_ne,
+                                      enc_proj_t, (size_t)H * sizeof(float));
+                int64_t g_ne[1] = { pred_hidden_ };
+                ggml_tensor* gv = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 1, g_ne,
+                                      g, (size_t)pred_hidden_ * sizeof(float));
+                ggml_tensor* Wp = pk::clone_weight(ctx, ml_, "joint.pred.weight");
+                ggml_tensor* pp = ggml_mul_mat(ctx, Wp, gv);            // [H]
+                ggml_tensor* bp = pk::clone_weight(ctx, ml_, "joint.pred.bias");
+                pp = ggml_add(ctx, pp, bp);
+                ggml_tensor* f = ggml_relu(ctx, ggml_add(ctx, ep, pp)); // [H]
+                ggml_tensor* Wo = pk::clone_weight(ctx, ml_, "joint.joint_net.2.weight");
+                ggml_tensor* y  = ggml_mul_mat(ctx, Wo, f);             // [V]
+                ggml_tensor* bo = pk::clone_weight(ctx, ml_, "joint.joint_net.2.bias");
+                y = ggml_add(ctx, y, bo);
+                return y;                                               // [V_plus]
+            }, logits);
+        assert(ok && "step_logits graph failed");
+        return;
+    }
+
+    // GPU replay path.
+    if (!replay_) {
+        replay_ = std::unique_ptr<StepReplay>(new StepReplay());
+        StepReplay* r = replay_.get();
+        r->rg = std::unique_ptr<ReplayGraph>(new ReplayGraph(
+            global_backend(),
+            [&](ggml_context* ctx) -> ggml_tensor* {
+                int64_t ep_ne[1] = { H };
+                r->ep = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 1, ep_ne,
+                                      enc_proj_t, (size_t)H * sizeof(float));
+                int64_t g_ne[1] = { pred_hidden_ };
+                r->g  = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 1, g_ne,
+                                      g, (size_t)pred_hidden_ * sizeof(float));
+                ggml_tensor* Wp = pk::clone_weight(ctx, ml_, "joint.pred.weight");
+                ggml_tensor* pp = ggml_mul_mat(ctx, Wp, r->g);     // [H]
+                ggml_tensor* bp = pk::clone_weight(ctx, ml_, "joint.pred.bias");
+                pp = ggml_add(ctx, pp, bp);
+                ggml_tensor* f = ggml_relu(ctx, ggml_add(ctx, r->ep, pp)); // [H]
+                ggml_tensor* Wo = pk::clone_weight(ctx, ml_, "joint.joint_net.2.weight");
+                ggml_tensor* y  = ggml_mul_mat(ctx, Wo, f);             // [V]
+                ggml_tensor* bo = pk::clone_weight(ctx, ml_, "joint.joint_net.2.bias");
+                y = ggml_add(ctx, y, bo);
+                return y;                                             // [V_plus]
+            }));
+        assert(r->rg->n_inputs() == 2 && "joint step graph must have 2 inputs");
+    }
+
+    replay_->rg->set_input(0, enc_proj_t, (size_t)H * sizeof(float));
+    replay_->rg->set_input(1, g, (size_t)pred_hidden_ * sizeof(float));
+    bool ok = replay_->rg->compute(logits);
+    assert(ok && "step_logits replay failed");
 }
 
 void Joint::step_logits_batch(const float* enc_proj_gathered,

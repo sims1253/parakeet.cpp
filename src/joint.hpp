@@ -1,5 +1,6 @@
 #pragma once
 #include "model_loader.hpp"
+#include <memory>
 #include <vector>
 
 namespace pk {
@@ -29,6 +30,7 @@ namespace pk {
 class Joint {
 public:
     explicit Joint(const ModelLoader& ml);
+    ~Joint();  // defined in the .cpp (StepReplay must be complete)
 
     // enc:  row-major [T, enc_hidden],  enc[t*enc_hidden + c]
     // pred: row-major [U, pred_hidden], pred[u*pred_hidden + h]
@@ -91,6 +93,13 @@ private:
     // Cached for shape asserts on the projection inputs.
     int enc_hidden_  = 0;   // ggml ne[0] of joint.enc.weight
     int pred_hidden_ = 0;   // ggml ne[0] of joint.pred.weight
+
+    // Replayable per-step joint graph (kept alive so ggml-cuda's CUDA-graph
+    // capture warms up and replays the per-token joint instead of launching
+    // every op directly). Lazily built on the first step_logits call; lives in
+    // the .cpp so the header need not include ReplayGraph.
+    struct StepReplay;
+    mutable std::unique_ptr<StepReplay> replay_;
 };
 
 } // namespace pk
