@@ -3,6 +3,7 @@
 #include <vector>
 #include <cstdint>
 #include <memory>
+#include <unordered_map>
 
 namespace pk {
 
@@ -103,10 +104,13 @@ private:
     // weights). [vocab_p1_ * H_], row-major: embed_host_[id*H_ + h].
     mutable std::vector<float> embed_host_;
 
-    // Replayable per-step LSTM graph (kept alive so ggml-cuda captures + replays
-    // the per-token prediction net). Lazily built on the first step() call.
+    // GPU-only: replayable per-step LSTM graph, lazily built on first step().
     struct StepReplay;
     mutable std::unique_ptr<StepReplay> replay_;
+
+    // GPU-only: one captured batched LSTM graph per batch size N, keyed on N.
+    struct StepReplayBatch;
+    mutable std::unordered_map<int, std::unique_ptr<StepReplayBatch>> replay_batch_;
 };
 
 } // namespace pk

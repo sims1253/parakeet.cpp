@@ -56,10 +56,8 @@ public:
     // registry device name for a GPU backend, e.g. the CUDA device name).
     const char* device_name() const { return device_name_.c_str(); }
 
-    // True iff the active backend is a non-CPU (GPU/IGPU) device. The graph-
-    // capture/replay decode optimisation only helps GPU (it is launch-overhead
-    // bound there); on CPU the per-step set_input + capture-readback overhead
-    // it adds is a net regression, so callers gate on this.
+    // True iff the active backend is a GPU. The replay optimisation only helps
+    // GPU (launch-overhead bound there); callers gate on this.
     bool is_gpu() const;
 
     // The underlying CPU ggml backend. Exposed so the loader can give its weight
@@ -158,30 +156,20 @@ void ensure_weights_realized(const ModelLoader& ml);
 // (preprocessing, batch-norm folding) — NOT for graph leaves (use clone_weight).
 void weight_to_host_f32(const ModelLoader& ml, const char* name, std::vector<float>& out);
 
-// A graph built ONCE and recomputed many times, keeping the SAME ggml context /
-// cgraph / input tensors alive across calls. The C++ analogue of megapar's
-// CUDA-graph step capture, realized through ggml's OWN capture:
-//
-// ggml-cuda keys its internal CUDA graph on `cgraph->nodes[0]` (a tensor pointer
-// owned by the compute context). Backend::compute does ggml_init + ggml_free
-// EVERY call, so every per-step graph gets a NEW context -> NEW node pointers ->
-// a different key -> CUDA-graph capture NEVER warms up and every tiny per-step
-// op is launched directly (the launch-overhead regime that dominates the GPU
-// transducer decode loop). ReplayGraph keeps the context + cgraph alive across
-// calls, so nodes[0] is a STABLE pointer: ggml-cuda warms up after one extra
-// direct eval and then replays the captured graph, collapsing the per-step
-// launch storm. On CPU this still wins by skipping the per-call ggml_init /
-// gallocr re-plan / ggml_free.
-//
-// The replayed graph's input tensors live in the (persistent) ggml context; the
-// caller feeds fresh data into them each step via the returned input handles.
+// A graph built ONCE and recomputed many times, keeping the SAME ggml context
+// + cgraph alive across calls. ggml-cuda keys its CUDA-graph capture on
+// cgraph->nodes[0], a tensor pointer owned by the compute context; Backend::compute
+// does ggml_init + ggml_free every call, so every per-step graph gets fresh node
+// pointers and the capture never warms up — every tiny op is launched directly,
+// which is what dominates the GPU transducer decode loop. ReplayGraph keeps the
+// context alive so nodes[0] is stable and ggml-cuda can capture + replay it.
+// Callers feed fresh input data each step via the recorded input handles.
 //
 // Usage:
 //   ReplayGraph rg(backend, [&](ggml_context* ctx){
 //       ggml_tensor* a = pk::graph_input_tensor(ctx, ...);
 //       return some_op(ctx, a, weight);
 //   });
-//   // build() recorded `a`'s handle; feed it:
 //   rg.set_input(0, host_a, nbytes_a);
 //   std::vector<float> out; rg.compute(out);
 class ReplayGraph {

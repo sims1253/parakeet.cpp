@@ -392,16 +392,12 @@ void weight_to_host_f32(const ModelLoader& ml, const char* name, std::vector<flo
 }
 
 // ---------------------------------------------------------------------------
-// ReplayGraph: build a graph once, recompute it many times on the persistent
-// backend/gallocr WITHOUT re-running ggml_init / gallocr_alloc / ggml_free per
-// call. Keeping the ggml context (and thus cgraph->nodes[0]) alive across calls
-// is what lets ggml-cuda's CUDA-graph capture warm up and replay — the direct
-// analogue of megapar's torch.cuda.CUDAGraph replay. See backend.hpp.
+// ReplayGraph: build a graph once, recompute it many times without re-running
+// ggml_init / gallocr_alloc / ggml_free per call. See backend.hpp.
 // ---------------------------------------------------------------------------
 ReplayGraph::ReplayGraph(Backend& backend,
                          const std::function<ggml_tensor*(ggml_context*)>& build)
     : backend_(backend) {
-    // Metadata-only context, kept alive for this ReplayGraph's lifetime.
     struct ggml_init_params params = {
         /* .mem_size   = */ ggml_tensor_overhead() * kGraphSize +
                             ggml_graph_overhead_custom(kGraphSize, false),
@@ -422,19 +418,18 @@ ReplayGraph::ReplayGraph(Backend& backend,
     t_active = prev_active;
     assert(out_ && "ReplayGraph: build() returned null output tensor");
 
-    // Record the input-tensor handles (registration order) BEFORE clearing
-    // pending, so set_input() can re-feed them later.
+    // Record input handles (registration order) and capture dsts BEFORE clearing
+    // pending/captures; compute_with_captures re-fills the dsts each step, so
+    // they must NOT be cleared like Backend::compute does.
     inputs_.reserve(impl->pending.size());
     for (const PendingInput& pi : impl->pending) inputs_.push_back(pi.tensor);
     impl->pending.clear();
-    // Likewise record capture tensors + dst (compute_with_captures re-fills them
-    // each step; they must NOT be cleared like Backend::compute does).
     captures_.reserve(impl->captures.size());
     for (const PendingCapture& pc : impl->captures)
         captures_.push_back({pc.tensor, pc.dst});
     impl->captures.clear();
 
-    // Mark the output AND every capture so the gallocr keeps them, then expand
+    // Mark the output AND every capture so the gallocr keeps them, then build
     // the forward graph over captures first (robust if the output's subgraph
     // does not reach them, mirroring Backend::compute).
     ggml_set_output(out_);
@@ -443,11 +438,8 @@ ReplayGraph::ReplayGraph(Backend& backend,
     for (const auto& cap : captures_) ggml_build_forward_expand(gf_, cap.first);
     ggml_build_forward_expand(gf_, out_);
 
-    // Allocate the graph ONCE now (persistent gallocr / sched) so the input
-    // tensors get ->buffer/->data set BEFORE the first set_input() call, and so
-    // the steady-state replay path does NOT re-plan the allocation per step.
-    // The persistent gallocr keeps the buffer for a stable graph shape across
-    // graph_compute calls, so one alloc here covers every replay.
+    // Allocate once now so the input tensors get ->buffer/->data set before the
+    // first set_input() call and the replay path never re-plans per step.
     if (!alloc_internal()) {
         assert(false && "ReplayGraph: initial graph allocation failed");
     }
@@ -459,11 +451,7 @@ ReplayGraph::~ReplayGraph() {
 
 void ReplayGraph::set_input(size_t i, const void* host, size_t nbytes) {
     assert(i < inputs_.size() && "ReplayGraph::set_input index out of range");
-    ggml_tensor* t = inputs_[i];
-    // The input tensor was marked ggml_set_input() during build() and allocated
-    // by the gallocr (in the constructor); its ->buffer/->data are set, so a
-    // tensor_set feeds the new step's data in place.
-    ggml_backend_tensor_set(t, host, 0, nbytes);
+    ggml_backend_tensor_set(inputs_[i], host, 0, nbytes);
 }
 
 // Allocate gf_ on the persistent gallocr (or sched fallback). Returns true on
@@ -509,12 +497,9 @@ bool ReplayGraph::compute(std::vector<float>& out) {
         return false;
     }
 
-    // Recompute the SAME already-allocated graph. The persistent gallocr keeps
-    // the buffer for this stable graph shape, so no per-step alloc is needed:
-    // set_input() wrote the new step's inputs into the persistent input tensors,
-    // and graph_compute reads them in place. Keeping the ggml context (and thus
-    // cgraph->nodes[0]) stable across calls is what lets ggml-cuda capture +
-    // replay the per-step work (megapar's win).
+    // Recompute the already-allocated graph; set_input() wrote the new step's
+    // inputs into the persistent input tensors and graph_compute reads them in
+    // place, so no per-step alloc is needed.
     enum ggml_status status = need_sched_
         ? ggml_backend_sched_graph_compute(impl->sched, gf_)
         : ggml_backend_graph_compute(impl->backend, gf_);
