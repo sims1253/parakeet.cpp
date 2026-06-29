@@ -3,6 +3,7 @@
 #include <vector>
 #include <cstdint>
 #include <memory>
+#include <unordered_map>
 
 namespace pk {
 
@@ -107,6 +108,11 @@ private:
     // the per-token prediction net). Lazily built on the first step() call.
     struct StepReplay;
     mutable std::unique_ptr<StepReplay> replay_;
+
+    // Per-batch-size replayable batched LSTM graph for step_batch (the batched
+    // decode loop calls with a FIXED N per batch). Keyed on N, lazily built.
+    struct StepReplayBatch;
+    mutable std::unordered_map<int, std::unique_ptr<StepReplayBatch>> replay_batch_;
 };
 
 } // namespace pk

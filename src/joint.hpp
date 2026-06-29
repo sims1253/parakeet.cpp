@@ -1,6 +1,7 @@
 #pragma once
 #include "model_loader.hpp"
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 namespace pk {
@@ -100,6 +101,12 @@ private:
     // the .cpp so the header need not include ReplayGraph.
     struct StepReplay;
     mutable std::unique_ptr<StepReplay> replay_;
+
+    // Per-batch-size replayable joint graph for step_logits_batch (the batched
+    // decode loop calls with a FIXED N per batch, so one captured graph per N is
+    // reused for every round of that batch). Keyed on N, lazily built.
+    struct StepReplayBatch;
+    mutable std::unordered_map<int, std::unique_ptr<StepReplayBatch>> replay_batch_;
 };
 
 } // namespace pk
