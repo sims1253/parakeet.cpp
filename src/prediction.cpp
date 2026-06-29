@@ -27,9 +27,12 @@ PredictionNet::~PredictionNet() = default;
 // step so ggml-cuda captures + replays the per-token prediction net.
 struct PredictionNet::StepReplay {
     std::unique_ptr<ReplayGraph> rg;
-    ggml_tensor* x0 = nullptr;               // input #0
-    std::vector<ggml_tensor*> h_in;          // per-layer (input 1 + 2*l)
-    std::vector<ggml_tensor*> c_in;          // per-layer (input 2 + 2*l)
+    ggml_tensor* x0 = nullptr;               // view into in_buf (layer-0 input)
+    std::vector<ggml_tensor*> h_in;          // views into in_buf (input 1 + 2*l)
+    std::vector<ggml_tensor*> c_in;          // views into in_buf (input 2 + 2*l)
+    // Coalesced per-step host input buffer [x0 | h0 | c0 | h1 | c1 ...], uploaded
+    // in ONE set_input (one cudaStreamSynchronize) instead of 5.
+    std::vector<float> in_buf;
     std::vector<std::vector<float>> cap_c;   // stable capture dsts
     std::vector<std::vector<float>> cap_h;
 };
@@ -139,7 +142,12 @@ void PredictionNet::step(int32_t token_id, bool is_sos,
         return;
     }
 
-    // GPU replay path.
+    // GPU replay path. Per-step inputs are COALESCED into ONE host buffer and
+    // uploaded with a single set_input (one cudaStreamSynchronize) instead of
+    // 5 separate set_input calls (x0 + 2*L h/c), since each set/get is a
+    // host-stalling sync on the CUDA backend. The graph slices the single input
+    // tensor into x0 / h_in[l] / c_in[l] views. Captures are still read per
+    // layer (see below); coalescing them is a follow-up.
     if (!replay_) {
         replay_ = std::unique_ptr<StepReplay>(new StepReplay());
         replay_->h_in.assign(L, nullptr);
@@ -147,12 +155,17 @@ void PredictionNet::step(int32_t token_id, bool is_sos,
         replay_->cap_c.assign(L, std::vector<float>((size_t)H));
         replay_->cap_h.assign(L, std::vector<float>((size_t)H));
         StepReplay* r = replay_.get();  // captures must read this stable addr
+        const int n_in_blocks = 1 + 2 * L;     // x0 + per-layer h,c
+        r->in_buf.assign((size_t)n_in_blocks * H, 0.0f);
         r->rg = std::unique_ptr<ReplayGraph>(new ReplayGraph(
             global_backend(),
             [&](ggml_context* ctx) -> ggml_tensor* {
-                int64_t ne1[1] = { H };
-                r->x0 = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 1, ne1,
-                            x0.data(), (size_t)H * sizeof(float));
+                // ONE input tensor holding [x0 | h0 | c0 | h1 | c1 ...].
+                int64_t in_ne[1] = { (int64_t)n_in_blocks * H };
+                ggml_tensor* in_all = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 1, in_ne,
+                            r->in_buf.data(), (size_t)n_in_blocks * H * sizeof(float));
+                // Slice views (offset in bytes).
+                r->x0 = ggml_view_1d(ctx, in_all, H, 0);
                 ggml_tensor* layer_in = r->x0;
                 ggml_tensor* top_h = nullptr;
                 for (int l = 0; l < L; ++l) {
@@ -165,10 +178,10 @@ void PredictionNet::step(int32_t token_id, bool is_sos,
                         ("decoder.prediction.dec_rnn.lstm.bias_ih" + s).c_str());
                     ggml_tensor* bhh = pk::clone_weight(ctx, ml_,
                         ("decoder.prediction.dec_rnn.lstm.bias_hh" + s).c_str());
-                    r->h_in[l] = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 1, ne1,
-                                        in.h[l].data(), (size_t)H * sizeof(float));
-                    r->c_in[l] = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 1, ne1,
-                                        in.c[l].data(), (size_t)H * sizeof(float));
+                    size_t h_off = (size_t)(1 + 2 * l)     * H * sizeof(float);
+                    size_t c_off = (size_t)(1 + 2 * l + 1) * H * sizeof(float);
+                    r->h_in[l] = ggml_view_1d(ctx, in_all, H, h_off);
+                    r->c_in[l] = ggml_view_1d(ctx, in_all, H, c_off);
                     ggml_tensor* z = ggml_add(ctx,
                         ggml_add(ctx, ggml_mul_mat(ctx, Wih, layer_in), bih),
                         ggml_add(ctx, ggml_mul_mat(ctx, Whh, r->h_in[l]), bhh));
@@ -186,15 +199,18 @@ void PredictionNet::step(int32_t token_id, bool is_sos,
                 }
                 return top_h;
             }));
-        assert(r->rg->n_inputs() == (size_t)(1 + 2 * L) &&
-               "pred step graph must have 1+2*L inputs");
+        assert(r->rg->n_inputs() == 1 && "pred step graph must have 1 coalesced input");
     }
 
-    replay_->rg->set_input(0, x0.data(), (size_t)H * sizeof(float));
+    // Pack this step's inputs into the single coalesced buffer (host memcpy, no
+    // sync) and upload once. Layout matches the build: [x0 | h0 | c0 | h1 | c1].
+    std::vector<float>& inb = replay_->in_buf;
+    std::memcpy(inb.data(), x0.data(), (size_t)H * sizeof(float));
     for (int l = 0; l < L; ++l) {
-        replay_->rg->set_input(1 + 2 * l, in.h[l].data(), (size_t)H * sizeof(float));
-        replay_->rg->set_input(2 + 2 * l, in.c[l].data(), (size_t)H * sizeof(float));
+        std::memcpy(inb.data() + (size_t)(1 + 2*l)     * H, in.h[l].data(), (size_t)H * sizeof(float));
+        std::memcpy(inb.data() + (size_t)(1 + 2*l + 1) * H, in.c[l].data(), (size_t)H * sizeof(float));
     }
+    replay_->rg->set_input(0, inb.data(), (size_t)(1 + 2 * L) * H * sizeof(float));
     bool ok = replay_->rg->compute_with_captures(g);
     assert(ok && "pred-net step replay failed");
     for (int l = 0; l < L; ++l) {

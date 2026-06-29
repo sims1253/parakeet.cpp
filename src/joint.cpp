@@ -15,8 +15,10 @@ namespace pk {
 // what lets ggml-cuda capture+replay the per-token joint (megapar's idea).
 struct Joint::StepReplay {
     std::unique_ptr<ReplayGraph> rg;
-    ggml_tensor* ep = nullptr;  // input #0: enc_proj row for frame t [H]
-    ggml_tensor* g  = nullptr;  // input #1: pred-net output g [P]
+    ggml_tensor* ep = nullptr;  // view into in_buf: enc_proj row for frame t [H]
+    ggml_tensor* g  = nullptr;  // view into in_buf: pred-net output g [P]
+    // Coalesced per-step host input [enc_proj_t | g], uploaded in ONE set_input.
+    std::vector<float> in_buf;
 };
 
 Joint::Joint(const ModelLoader& ml) : ml_(ml) {
@@ -115,19 +117,23 @@ void Joint::step_logits(const float* enc_proj_t,
         return;
     }
 
-    // GPU replay path.
+    // GPU replay path. Per-step inputs are COALESCED into ONE host buffer
+    // [enc_proj_t | g] and uploaded with a single set_input (one
+    // cudaStreamSynchronize) instead of two separate set_input calls.
     if (!replay_) {
         replay_ = std::unique_ptr<StepReplay>(new StepReplay());
         StepReplay* r = replay_.get();
+        const int P = pred_hidden_;
+        r->in_buf.assign((size_t)(H + P), 0.0f);
         r->rg = std::unique_ptr<ReplayGraph>(new ReplayGraph(
             global_backend(),
             [&](ggml_context* ctx) -> ggml_tensor* {
-                int64_t ep_ne[1] = { H };
-                r->ep = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 1, ep_ne,
-                                      enc_proj_t, (size_t)H * sizeof(float));
-                int64_t g_ne[1] = { pred_hidden_ };
-                r->g  = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 1, g_ne,
-                                      g, (size_t)pred_hidden_ * sizeof(float));
+                // ONE input tensor holding [enc_proj_t (H) | g (P)].
+                int64_t in_ne[1] = { (int64_t)(H + P) };
+                ggml_tensor* in_all = pk::graph_input_tensor(ctx, GGML_TYPE_F32, 1, in_ne,
+                                      r->in_buf.data(), (size_t)(H + P) * sizeof(float));
+                r->ep = ggml_view_1d(ctx, in_all, H, 0);
+                r->g  = ggml_view_1d(ctx, in_all, P, (size_t)H * sizeof(float));
                 ggml_tensor* Wp = pk::clone_weight(ctx, ml_, "joint.pred.weight");
                 ggml_tensor* pp = ggml_mul_mat(ctx, Wp, r->g);     // [H]
                 ggml_tensor* bp = pk::clone_weight(ctx, ml_, "joint.pred.bias");
@@ -139,11 +145,14 @@ void Joint::step_logits(const float* enc_proj_t,
                 y = ggml_add(ctx, y, bo);
                 return y;                                             // [V_plus]
             }));
-        assert(r->rg->n_inputs() == 2 && "joint step graph must have 2 inputs");
+        assert(r->rg->n_inputs() == 1 && "joint step graph must have 1 coalesced input");
     }
 
-    replay_->rg->set_input(0, enc_proj_t, (size_t)H * sizeof(float));
-    replay_->rg->set_input(1, g, (size_t)pred_hidden_ * sizeof(float));
+    // Pack [enc_proj_t | g] into the coalesced buffer (host memcpy) and upload once.
+    const int P = pred_hidden_;
+    std::memcpy(replay_->in_buf.data(), enc_proj_t, (size_t)H * sizeof(float));
+    std::memcpy(replay_->in_buf.data() + H, g, (size_t)P * sizeof(float));
+    replay_->rg->set_input(0, replay_->in_buf.data(), (size_t)(H + P) * sizeof(float));
     bool ok = replay_->rg->compute(logits);
     assert(ok && "step_logits replay failed");
 }
